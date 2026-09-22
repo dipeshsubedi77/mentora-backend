@@ -2,6 +2,13 @@
 # AI / NLP
 # ==============================
 
+# Pin CPU-only torch (the Dockerfile installs these from download.pytorch.org/whl/cpu
+# BEFORE requirements.txt, so pip sees them as satisfied and never re-pulls the
+# multi-GB CUDA wheels that OOM Render's 512MB instances).
+torch==2.5.1
+torchvision==0.20.1
+torchaudio==2.5.1
+
 openai>=1.0.0
 langchain>=0.2.0
 langchain-groq>=0.1.9
