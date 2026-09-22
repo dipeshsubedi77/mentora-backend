@@ -1,0 +1,29 @@
+# Secrets — never copy into the image
+.env
+.env.*
+!.env.example
+
+# Local data / runtime artifacts
+uploads/
+chromadb/
+chroma/
+logs/
+*.log
+
+# Python caches / bytecode
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# Git / IDE
+.git/
+.gitignore
+.idea/
+.vscode/
+
+# Tests (not needed at runtime)
+tests/

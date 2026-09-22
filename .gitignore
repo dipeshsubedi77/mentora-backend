@@ -1,0 +1,21 @@
+# Environment
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+venv/
+.venv/
+
+# Runtime data
+uploads/
+chromadb/
+logs/
+*.log
+stderr.log
+stdout.log
+
+# Tests
+.pytest_cache/
