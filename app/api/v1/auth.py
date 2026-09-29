@@ -99,7 +99,7 @@ async def register(
         full_name=user_data.full_name,
         role=role_value,
         is_active=True,
-        is_verified=True,
+        is_verified=False,
         hashed_password=hashed_password,
     )
     try:
@@ -295,7 +295,8 @@ async def login(
 ):
     user_result = await db.execute(
         select(User).where(
-            (User.email == form_data.username) | (User.username == form_data.username)
+            (func.lower(User.email) == form_data.username.lower())
+            | (func.lower(User.username) == form_data.username.lower())
         )
     )
     user = user_result.scalars().first()

@@ -3,8 +3,15 @@ FROM python:3.12-slim
 WORKDIR /app
 
 # Install system dependencies
+# gcc: build tools for some Python wheels
+# tesseract-ocr: OCR for scanned/image-only PDFs and images (pytesseract)
+# tesseract-ocr-eng: English language data (default, avoids extra langs)
+# poppler-utils: provides pdftoppm used by pdf2image for OCR fallback
 RUN apt-get update && apt-get install -y --no-install-recommends \
     gcc \
+    tesseract-ocr \
+    tesseract-ocr-eng \
+    poppler-utils \
     && rm -rf /var/lib/apt/lists/*
 
 # Install CPU-only PyTorch first (avoids multi-GB CUDA wheels that OOM 512MB instances)

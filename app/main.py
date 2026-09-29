@@ -6,7 +6,8 @@ import os
 import logging
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
@@ -17,6 +18,7 @@ from app.database.database import init_db
 from app.api.v1 import (
     auth,
     ai_detection,
+    humanize,
     users,
     syllabus,
     study_plan,
@@ -30,6 +32,8 @@ from app.api.v1 import (
     weak_topics,
     voice,
     reports,
+    reviews,
+    stats,
     dashboard,
     admin,
     exams,
@@ -91,19 +95,6 @@ app = FastAPI(
 
 
 # --------------------------------------------------
-# CORS Middleware
-# --------------------------------------------------
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=settings.ALLOWED_ORIGINS,
-    allow_credentials=True,
-    allow_methods=settings.ALLOWED_METHODS,
-    allow_headers=settings.ALLOWED_HEADERS,
-)
-
-
-# --------------------------------------------------
 # Static Files
 # --------------------------------------------------
 
@@ -125,12 +116,28 @@ app.mount(
 
 
 # --------------------------------------------------
-# Rate Limit Middleware
+# Rate Limit Middleware (added BEFORE CORS)
 # --------------------------------------------------
 
 app.add_middleware(
     RateLimitMiddleware,
     requests_per_minute=settings.RATE_LIMIT_PER_MINUTE,
+)
+
+
+# --------------------------------------------------
+# CORS Middleware (added LAST = outermost wrapper)
+# Wraps all requests and responses, guaranteeing CORS
+# headers on ALL responses (including 4xx and 5xx).
+# --------------------------------------------------
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=settings.ALLOWED_ORIGINS,
+    allow_origin_regex=r"^https:\/\/.*\.vercel\.app$|^https:\/\/.*\.onrender\.com$|^http:\/\/localhost(:\d+)?$|^http:\/\/127\.0\.0\.1(:\d+)?$",
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 
@@ -148,6 +155,12 @@ app.include_router(
     ai_detection.router,
     prefix=f"{settings.API_PREFIX}/ai-detection",
     tags=["ai-detection"],
+)
+
+app.include_router(
+    humanize.router,
+    prefix=f"{settings.API_PREFIX}/humanize",
+    tags=["humanize"],
 )
 
 app.include_router(
@@ -283,6 +296,18 @@ app.include_router(
 )
 
 app.include_router(
+    reviews.router,
+    prefix=f"{settings.API_PREFIX}/reviews",
+    tags=["reviews"],
+)
+
+app.include_router(
+    stats.router,
+    prefix=f"{settings.API_PREFIX}/stats",
+    tags=["stats"],
+)
+
+app.include_router(
     notes.router,
     prefix=f"{settings.API_PREFIX}/notes",
     tags=["notes"],
@@ -320,6 +345,23 @@ async def root():
 # --------------------------------------------------
 # Health Check
 # --------------------------------------------------
+
+# --------------------------------------------------
+# Global Exception Handler
+# --------------------------------------------------
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception):
+    """
+    Catch-all exception handler to ensure unexpected errors
+    return a valid JSON response with CORS headers attached.
+    """
+    logger.exception("Unhandled error processing %s %s: %s", request.method, request.url.path, exc)
+    return JSONResponse(
+        status_code=500,
+        content={"detail": "An internal server error occurred. Please try again later."},
+    )
+
 
 @app.get(f"{settings.API_PREFIX}/health")
 async def health_check():

@@ -2,8 +2,9 @@
 Middleware - Rate limiting
 """
 import time
-from fastapi import Request, HTTPException, status
+from fastapi import Request
 from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.responses import JSONResponse
 from app.core.config import settings
 from app.core.logger import get_logger
 
@@ -28,13 +29,20 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         if not settings.RATE_LIMIT_ENABLED:
             return await call_next(request)
 
+        # Always pass OPTIONS (preflight) straight through so CORS middleware
+        # can handle it — blocking OPTIONS would cause CORS errors.
         if request.method == "OPTIONS":
             return await call_next(request)
 
         if any(request.url.path.startswith(p) for p in self.EXEMPT_PREFIXES):
             return await call_next(request)
 
-        client_host = request.client.host
+        forwarded = request.headers.get("x-forwarded-for")
+        client_host = (
+            forwarded.split(",")[0].strip()
+            if forwarded
+            else (request.client.host if request.client else "unknown")
+        )
         current_time = time.time()
 
         if client_host not in self.request_history:
@@ -47,9 +55,20 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
 
         if len(self.request_history[client_host]) >= self.requests_per_minute:
             logger.warning(f"Rate limit exceeded for {client_host}")
-            raise HTTPException(
-                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-                detail="Rate limit exceeded. Please try again later.",
+            # Use JSONResponse (NOT raise HTTPException) so this response
+            # still passes through CORSMiddleware and gets the
+            # Access-Control-Allow-Origin header attached.
+            origin = request.headers.get("origin", "")
+            allowed = settings.ALLOWED_ORIGINS
+            cors_origin = origin if (origin in allowed or "*" in allowed) else ""
+            headers = {}
+            if cors_origin:
+                headers["Access-Control-Allow-Origin"] = cors_origin
+                headers["Access-Control-Allow-Credentials"] = "true"
+            return JSONResponse(
+                status_code=429,
+                content={"detail": "Rate limit exceeded. Please try again later."},
+                headers=headers,
             )
 
         self.request_history[client_host].append(current_time)

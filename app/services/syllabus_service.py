@@ -14,6 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from langchain_core.documents import Document
 
+from app.core.config import settings
 from app.core.logger import get_logger
 from app.models.syllabus import Syllabus, Subject, Chapter
 from app.schemas.syllabus import SyllabusStatus
@@ -464,7 +465,14 @@ class SyllabusService:
 
             if embedding_ok and syllabus.status == "parsed":
                 syllabus.status = "rag_ready"
-            elif not embedding_ok and extracted_text.strip():
+            elif (
+                not embedding_ok
+                and extracted_text.strip()
+                and getattr(settings, "RAG_EMBEDDINGS_ENABLED", True)
+            ):
+                # Only mark the embedding step as failed when it was
+                # actually attempted.  When it is disabled on constrained
+                # deployments we keep the more useful "parsed" status.
                 syllabus.status = "embedding_failed"
 
             logger.info(
@@ -731,6 +739,14 @@ class SyllabusService:
 
         Returns True if embedding succeeded, False otherwise.
         """
+
+        if not getattr(settings, "RAG_EMBEDDINGS_ENABLED", True):
+            logger.info(
+                "[Syllabus] RAG embedding disabled for syllabus %s "
+                "(RAG_EMBEDDINGS_ENABLED=False); skipping vector store",
+                syllabus.id,
+            )
+            return False
 
         if not extracted_text or not extracted_text.strip():
             logger.warning(

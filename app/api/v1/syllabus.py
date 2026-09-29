@@ -4,11 +4,10 @@ Syllabus API endpoints
 import os
 from typing import List, Optional
 
-import pytesseract
 import logging
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile, status
+from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, Query, UploadFile, status
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, insert
+from sqlalchemy import select
 from sqlalchemy.orm import selectinload
 
 from app.core.auth import get_current_user_id
@@ -18,8 +17,8 @@ from app.database.database import get_db
 from app.models.syllabus import Syllabus, Subject, Chapter
 from app.models.subscription import UsageType
 from app.schemas.syllabus import (
-    SyllabusCreate, SyllabusOut, SyllabusUpdate, SyllabusStatus,
-    SyllabusSearchRequest, SyllabusSearchResponse
+    SyllabusOut, SyllabusUpdate, SyllabusStatus,
+    SyllabusSearchResponse
 )
 from app.services.syllabus_service import SyllabusService
 
@@ -29,9 +28,91 @@ syllabus_service = SyllabusService()
 logger = logging.getLogger(__name__)
 
 
+async def _process_syllabus_in_background(syllabus_id: int, user_id: int) -> None:
+    """OCR + LLM parsing + RAG embedding, run outside the HTTP request.
+
+    The upload/analyze handlers schedule this via FastAPI BackgroundTasks
+    so the client gets an immediate 201/200 instead of holding the
+    connection open while heavy processing runs (which previously caused
+    502s and worker OOMs on small instances).  The syllabus row's
+    ``status`` tracks progress and callers can poll
+    ``GET /api/v1/syllabus/{id}``.
+
+    Usage is recorded only after processing succeeds, matching the old
+    synchronous semantics.
+    """
+    from app.database.database import AsyncSessionLocal
+
+    try:
+        async with AsyncSessionLocal() as db:
+            try:
+                result = await db.execute(
+                    select(Syllabus).where(Syllabus.id == syllabus_id)
+                )
+                syllabus = result.scalars().first()
+                if syllabus is None:
+                    logger.error(
+                        "[BackgroundSyllabus] syllabus %s not found", syllabus_id
+                    )
+                    return
+
+                if syllabus.status == SyllabusStatus.PROCESSING.value:
+                    logger.warning(
+                        "[BackgroundSyllabus] syllabus %s already processing",
+                        syllabus_id,
+                    )
+                    return
+
+                syllabus.status = SyllabusStatus.PROCESSING.value
+                await db.commit()
+
+                await syllabus_service.process_syllabus(db, syllabus)
+                await db.commit()
+
+                # Usage is recorded only after processing succeeded.
+                await record_usage(db, user_id, UsageType.SYLLABUS_ANALYSIS)
+                await db.commit()
+
+                logger.info(
+                    "[BackgroundSyllabus] syllabus %s processed (status=%s)",
+                    syllabus_id,
+                    syllabus.status,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.exception(
+                    "[BackgroundSyllabus] processing failed for syllabus %s: %s",
+                    syllabus_id,
+                    exc,
+                )
+                await db.rollback()
+                try:
+                    result = await db.execute(
+                        select(Syllabus).where(Syllabus.id == syllabus_id)
+                    )
+                    syllabus = result.scalars().first()
+                    if syllabus is not None:
+                        syllabus.status = SyllabusStatus.FAILED.value
+                        await db.commit()
+                        logger.info(
+                            "[BackgroundSyllabus] marked syllabus %s as failed",
+                            syllabus_id,
+                        )
+                except Exception:  # noqa: BLE001
+                    logger.exception(
+                        "[BackgroundSyllabus] failed to mark syllabus %s as failed",
+                        syllabus_id,
+                    )
+    except Exception:  # noqa: BLE001
+        logger.exception(
+            "[BackgroundSyllabus] background task crashed for syllabus %s",
+            syllabus_id,
+        )
+
+
 @router.post("/", response_model=SyllabusOut, status_code=status.HTTP_201_CREATED)
 @router.post("/upload", response_model=SyllabusOut, status_code=status.HTTP_201_CREATED)
 async def upload_syllabus(
+    background_tasks: BackgroundTasks,
     title: str = Form(...),
     file: UploadFile = File(...),
     description: Optional[str] = Form(None),
@@ -87,39 +168,28 @@ async def upload_syllabus(
         description=description,
         file_path=file_path,
         file_type=file_ext,
-        status=SyllabusStatus.UPLOADED.value,
+        status=SyllabusStatus.PROCESSING.value,
     )
     db.add(new_syllabus)
     await db.commit()
     # NOTE: intentionally skip db.refresh(new_syllabus).
-    # With expire_on_commit=False the PK is already populated, and
-    # calling refresh would trigger selectin loading of subjects as an
-    # empty list (they don't exist yet).  That empty list would then be
-    # cached in the identity map and returned by the selectinload query
-    # below, causing the response to contain zero subjects.
+    # With expire_on_commit=False the PK is already populated.
 
-    try:
-        await syllabus_service.process_syllabus(db, new_syllabus)
-        await db.commit()
-    except pytesseract.TesseractNotFoundError:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail=(
-                "OCR engine (Tesseract) is not installed or not configured. "
-                "Contact the administrator to enable syllabus processing."
-            ),
-        )
-    except ValueError as e:
-        await db.commit()
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail=str(e),
-        )
+    # Respond immediately; heavy OCR/LLM/embedding work runs afterwards in
+    # the background so the upload no longer 502s / OOMs small instances.
+    background_tasks.add_task(
+        _process_syllabus_in_background, new_syllabus.id, user_id
+    )
 
-    # Usage is recorded only after processing succeeded.
-    await record_usage(db, user_id, UsageType.SYLLABUS_ANALYSIS)
+    logger.info(
+        "[UploadSyllabus] Accepted %s (id=%s) for background processing; "
+        "status=%s",
+        file_name,
+        new_syllabus.id,
+        new_syllabus.status,
+    )
 
-    # Reload the syllabus with subjects and chapters eager-loaded.
+    # Reload the syllabus so the response model serializes cleanly.
     result = await db.execute(
         select(Syllabus)
         .where(Syllabus.id == new_syllabus.id)
@@ -129,34 +199,6 @@ async def upload_syllabus(
         .execution_options(populate_existing=True)
     )
     syllabus = result.scalars().first()
-
-    return syllabus
-
-    if syllabus is None:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to reload syllabus after processing.",
-        )
-
-    logger.info(
-        "[UploadSyllabus] Response: id=%s, status=%s, title=%s, "
-        "subjects_count=%d, parsed_data_keys=%s, is_processed=%s, "
-        "is_ai_processed=%s",
-        syllabus.id,
-        syllabus.status,
-        syllabus.title,
-        len(syllabus.subjects or []),
-        list((syllabus.parsed_data or {}).keys()),
-        syllabus.is_processed,
-        syllabus.is_ai_processed,
-    )
-    for subj in syllabus.subjects or []:
-        logger.info(
-            "[UploadSyllabus] Subject: name=%s, chapters=%d",
-            subj.name,
-            len(subj.chapters or []),
-        )
-
     return syllabus
 
 
@@ -296,6 +338,7 @@ async def delete_syllabus(
 @router.post("/{syllabus_id}/analyze", response_model=SyllabusOut)
 async def analyze_syllabus(
     syllabus_id: int,
+    background_tasks: BackgroundTasks,
     db: AsyncSession = Depends(get_db),
     user_id: int = Depends(get_current_user_id),
     quota: QuotaContext = Depends(require_ai_quota(UsageType.SYLLABUS_ANALYSIS)),
@@ -310,40 +353,21 @@ async def analyze_syllabus(
             detail="Syllabus not found",
         )
 
-    try:
-        await syllabus_service.process_syllabus(db, syllabus)
-    except pytesseract.TesseractNotFoundError:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail=(
-                "OCR engine (Tesseract) is not installed or not configured. "
-                "Contact the administrator to enable syllabus processing."
-            ),
-        )
+    # Re-processing runs in the background so the request returns quickly
+    # instead of blocking on OCR/LLM/embedding (which can 502/OOM small
+    # instances).  Status is poll-able via GET /api/v1/syllabus/{id}.
+    syllabus.status = SyllabusStatus.PROCESSING.value
+    await db.commit()
 
-    # Usage is recorded only after processing succeeded.
-    await record_usage(db, user_id, UsageType.SYLLABUS_ANALYSIS)
+    background_tasks.add_task(_process_syllabus_in_background, syllabus_id, user_id)
 
-    from app.database.database import AsyncSessionLocal
-
-    async with AsyncSessionLocal() as fresh_db:
-        result = await fresh_db.execute(
-            select(Syllabus)
-            .where(Syllabus.id == syllabus.id)
-            .options(
-                selectinload(Syllabus.subjects).selectinload(Subject.chapters)
-            )
-        )
-        fresh_syllabus = result.scalars().first()
-
-    if fresh_syllabus is None:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to reload syllabus after analyze.",
-        )
-
-    syllabus.subjects = fresh_syllabus.subjects
-    return syllabus
+    result = await db.execute(
+        select(Syllabus)
+        .options(selectinload(Syllabus.subjects).selectinload(Subject.chapters))
+        .where(Syllabus.id == syllabus_id)
+    )
+    updated = result.scalars().first()
+    return updated
 
 
 @router.get("/{syllabus_id}/subjects")

@@ -6,6 +6,9 @@ import os
 import socket
 from typing import List, Optional
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+from dotenv import load_dotenv
+
+load_dotenv()
 
 from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -212,6 +215,11 @@ class Settings(BaseSettings):
     GROQ_SYLLABUS_CHUNK_OVERLAP: int = 0
 
     EMBEDDING_MODEL: str = "sentence-transformers/all-MiniLM-L6-v2"
+    # Set to False on memory-constrained deployments (e.g. Render free
+    # 512 MB instances) to skip the local HuggingFace embedding model
+    # entirely.  Syllabus parsing + notes/quiz/flashcard generation keep
+    # working from extracted_text/parsed_data; only RAG retrieval skips.
+    RAG_EMBEDDINGS_ENABLED: bool = True
     LLM_MAX_INPUT_CHARS: int = 12000
     TUTOR_HISTORY_TURNS: int = 3
     # ============================================================
@@ -278,6 +286,13 @@ class Settings(BaseSettings):
     # Minimum analyzable prose words before a verdict is returned; below
     # this the response reports "Insufficient text for reliable detection".
     AI_DETECTION_MIN_WORDS: int = 40
+    # When the statistical detector finds no explicit spans on analysable
+    # text, use an LLM stylistic reviewer to locate machine-written
+    # sentences and surface them as highlighted spans.  This catches
+    # natural-sounding generated prose that stylometric signals alone
+    # cannot separate from formal human writing.  Only active when a Groq
+    # key is configured.
+    AI_DETECTION_LLM_HIGHLIGHT_ENABLED: bool = True
 
     # Optional ML model blending (default OFF so the app runs offline).
     AI_DETECTOR_MODEL_ENABLED: bool = False
@@ -321,14 +336,22 @@ class Settings(BaseSettings):
 
         origins_str = os.getenv(
             "ALLOWED_ORIGINS",
-            "http://localhost:3000,http://localhost:5173,http://127.0.0.1:5173,http://localhost:5174,http://127.0.0.1:5174,http://localhost:8000,http://127.0.0.1:8000",
+            "http://localhost:3000,http://localhost:5173,http://127.0.0.1:5173,http://localhost:5174,http://127.0.0.1:5174,http://localhost:8000,http://127.0.0.1:8000,https://frontendmentora.vercel.app,https://mentora-backend-9.onrender.com",
         )
 
         origins = [
-            origin.strip()
+            origin.strip().rstrip("/")
             for origin in origins_str.split(",")
             if origin.strip()
         ]
+
+        for p_origin in [
+            "https://frontendmentora.vercel.app",
+            "https://mentora-backend-9.onrender.com",
+            (self.FRONTEND_URL or "").strip().rstrip("/"),
+        ]:
+            if p_origin and p_origin not in origins:
+                origins.append(p_origin)
 
         lan_ip = _get_lan_ip()
         if lan_ip:
@@ -389,6 +412,7 @@ class Settings(BaseSettings):
         "CODING_PROBLEM_GENERATION": 3,
         "SYLLABUS_ANALYSIS": 2,
         "AI_DETECTION": 3,
+        "AI_HUMANIZE": 3,
     }
 
     SUBSCRIPTION_DAILY_LIMITS: dict = {
@@ -400,6 +424,7 @@ class Settings(BaseSettings):
         "CODING_PROBLEM_GENERATION": 30,
         "SYLLABUS_ANALYSIS": 20,
         "AI_DETECTION": 30,
+        "AI_HUMANIZE": 30,
     }
 
     # Per-plan Redis request rate limits (requests per minute).
